@@ -88,7 +88,8 @@ EXCLUSION_FLAGS = [
     "NAVWARN",
 ]
 
-
+# L2 Mask default
+EXCLUSION_FLAGS = ["LAND", "HILT", "STRAYLIGHT", "CLDICE"]
 
 ##---------------------------------------------------------------------------##
 #                             Satellite Utilities                             #
@@ -115,7 +116,7 @@ def parse_quality_flags(flag_value):
     ]
 
 
-def get_fivebyfive(file, latitude, longitude, rrs_wavelengths):
+def get_fivebyfive(file, latitude, longitude, sat, sat_variables):
     """Get stats on 5x5 box around station coordinates of a satellite granule.
 
     This checks l2flags and runs statistics on valid pixels and returns their
@@ -175,18 +176,27 @@ def get_fivebyfive(file, latitude, longitude, rrs_wavelengths):
     # Extract the data
     # NOTE: This is hard-coded to Rrs from an L2 AOP file.
     with xr.open_dataset(file, group="geophysical_data") as ds_data:
-        rrs_data = (
-            ds_data["Rrs"].isel(
-                number_of_lines=slice(line_start, line_end),
-                pixels_per_line=slice(pixel_start, pixel_end),
-            ).values
-        )
+        
+        if 'AOP' in sat:
+            sat_data = (ds_data["Rrs"].isel(
+                    number_of_lines=slice(line_start, line_end),
+                    pixels_per_line=slice(pixel_start, pixel_end)).values)
+            
+        elif 'BGC' in sat:
+
+            # Subset pixels
+            sat_data = ds_data.isel(
+                    number_of_lines=slice(line_start, line_end),
+                    pixels_per_line=slice(pixel_start, pixel_end))
+
+            x = sat_data[sat_variables].to_array().values
+            sat_data = (np.moveaxis(x, 0, -1))
+            
         flags_data = (
             ds_data["l2_flags"].isel(
                 number_of_lines=slice(line_start, line_end),
                 pixels_per_line=slice(pixel_start, pixel_end),
-            ).values
-        )
+            ).values)
 
     # Calculate the bitwise OR of all flags in EXCLUSION_FLAGS to get a mask
     exclude_mask = sum(L2_FLAGS[flag] for flag in EXCLUSION_FLAGS)
@@ -197,26 +207,30 @@ def get_fivebyfive(file, latitude, longitude, rrs_wavelengths):
 
     # Get stats and averages
     if valid_mask.any():
-        rrs_valid = rrs_data[valid_mask]
-        rrs_std_initial = np.std(rrs_valid, axis=0)
-        rrs_mean_initial = np.mean(rrs_valid, axis=0)
+        
+        valid = sat_data[valid_mask]
+        std_initial = np.std(valid, axis=0)
+        mean_initial = np.mean(valid, axis=0)
 
         # Exclude spectra > 1.5 stdevs away
         std_mask = np.all(
-            np.abs(rrs_valid - rrs_mean_initial) <= 1.5 * rrs_std_initial,
+            np.abs(valid - mean_initial) <= 1.5 * std_initial,
             axis=1
         )
-        rrs_std = np.std(rrs_valid[std_mask], axis=0)
-        rrs_mean = np.mean(rrs_valid[std_mask], axis=0).flatten()
+        sat_std = np.std(valid[std_mask], axis=0)
+        sat_mean = np.mean(valid[std_mask], axis=0).flatten()
 
         # Matchup criteria uses cv as median of 405-570nm
-        rrs_cv = rrs_std / rrs_mean
-        rrs_cv_median = np.median(
-            rrs_cv[(rrs_wavelengths >= 405) & (rrs_wavelengths <= 570)]
-        )
+        cv = sat_std / sat_mean
+
+        if 'AOP' in sat:
+            cv_median = np.median(cv[(sat_variables >= 405) & (sat_variables <= 570)])
+        else:
+            cv_median = np.nan
+            
     else:
-        rrs_cv_median = np.nan
-        rrs_mean = np.nan * np.empty_like(rrs_wavelengths)
+        cv_median = np.nan
+        sat_mean = np.nan * np.empty_like(np.array(sat_variables),dtype='float64')
 
     # Put in dictionary of the row
     row = {
@@ -224,19 +238,22 @@ def get_fivebyfive(file, latitude, longitude, rrs_wavelengths):
             file.granule["umm"]["TemporalExtent"]["RangeDateTime"]["BeginningDateTime"],
             utc=0
         ),
-        "sat_cv": rrs_cv_median,
+        "sat_cv": cv_median,
         "sat_latitude": sat_lat[center_line, center_pixel],
         "sat_longitude": sat_lon[center_line, center_pixel],
         "sat_pixel_valid": np.sum(valid_mask),
     }
 
     # Add mean spectra to the row dictionary
-    for wavelength, mean_value in zip(rrs_wavelengths, rrs_mean):
-        key = f"sat_rrs{int(wavelength)}"
+    for wavelength, mean_value in zip(sat_variables, sat_mean):
+
+        if 'AOP' in sat:
+            key = f"sat_rrs{int(wavelength)}"
+        elif 'BGC' in sat:
+            key = 'sat_'+wavelength
         row[key] = mean_value
 
     return row
-
 
 def get_sat_ts_matchups(
     start_date,
@@ -295,8 +312,9 @@ def get_sat_ts_matchups(
     short_name = SAT_LOOKUP[sat]
 
     # Format search parameters
-    time_bounds = (f"{start_date}T00:00:00", f"{end_date}T23:59:59")
-
+    # time_bounds = (f"{start_date}T00:00:00", f"{end_date}T23:59:59")
+    time_bounds = (start_date, end_date)
+    
     # Run Earthaccess data search
     results = earthaccess.search_data(
         point=(longitude, latitude),
@@ -315,117 +333,28 @@ def get_sat_ts_matchups(
     else:
         files = earthaccess.open(results)
 
-    # Pull out Rrs wavelengths for easier processing
-    with xr.open_dataset(files[0], group="sensor_band_parameters") as ds_bands:
-        rrs_wavelengths = ds_bands["wavelength_3d"].values
-
-    # Loop through files and process
     sat_rows = []
-    for idx, file in enumerate(files):
-        granule_date = pd.to_datetime(
-            file.granule["umm"]["TemporalExtent"]["RangeDateTime"]["BeginningDateTime"]
-        )
-        print(f"Running Granule: {granule_date}")
-        row = get_fivebyfive(file, latitude, longitude, rrs_wavelengths)
-        sat_rows.append(row)
+    
+    if len(files) > 0:
+        # Pull out Rrs wavelengths for easier processing
+
+        if 'AOP' in sat:
+            with xr.open_dataset(files[0], group="sensor_band_parameters") as ds_bands:
+                sat_variables = ds_bands["wavelength_3d"].values
+        elif 'BGC' in sat:
+            with xr.open_dataset(files[0], group="geophysical_data") as ds_bands:
+                sat_variables = list(ds_bands.variables)[:-1]
+                                     
+        # Loop through files and process
+        
+        for idx, file in enumerate(files):
+            granule_date = pd.to_datetime(
+                file.granule["umm"]["TemporalExtent"]["RangeDateTime"]["BeginningDateTime"]
+            )
+            print(f"Running Granule: {granule_date}")
+            row = get_fivebyfive(file, latitude, longitude, sat,  sat_variables)
+            sat_rows.append(row)
+    else:
+        print('None granules found.')
 
     return pd.DataFrame(sat_rows)
-
-
-##---------------------------------------------------------------------------##
-#                              Matchup Utilities                              #
-##---------------------------------------------------------------------------##
-
-
-def match_data(
-    df_sat,
-    df_field,
-    cv_max=0.15,
-    senz_max=60.0,
-    min_percent_valid=55.0,
-    max_time_diff=180,
-    std_max=1.5,
-):
-    """Create matchup dataframe based on selection criteria.
-
-    Parameters
-    ----------
-    df_sat : pandas dataframe
-        Satellite data from flat validation file.
-    df_field : pandas dataframe
-        Field data from flat validation file.
-    cv_max : float, default 0.15
-        Maximum coefficient of variation (stdev/mean) for sat data.
-    senz_max : float, default 60.0
-        Maximum sensor zenith for sat data.
-    min_percent_valid : float, default 55.0
-        Minimum percentage of valid satellite pixels.
-    max_time_diff : int, default 180
-        Maximum time difference (minutes) between sat and field matchup.
-    std_max : float, default 1.5
-        If multiple valid field matchups, select within std_max stdevs of mean.
-
-    Returns
-    -------
-    pandas dataframe of matchups for product
-
-    Notes
-    -----
-    This is hard-coded to match on Rrs for the demo. For other products, take
-    out the cv parameter and make the row product column search more generic.
-    """
-    # Setup
-    time_window = pd.Timedelta(minutes=max_time_diff)
-    df_match_list = []
-
-    # Filter Field data based on Solar Zenith
-    df_field_filtered = df_field[df_field["field_solar_zenith"] <= senz_max]
-
-    # Filter satellite data based on cv threshold
-    df_sat_filtered = df_sat[df_sat["sat_cv"] <= cv_max]
-
-    # Filter satellite data based on percent good pixels
-    df_sat_filtered = df_sat_filtered[
-        df_sat_filtered["sat_pixel_valid"] >= min_percent_valid * 25 / 100
-    ]
-
-    for _, sat_row in df_sat_filtered.iterrows():
-        # Filter field data based on time difference and coordinates
-        time_diff = abs(
-            df_field_filtered["field_datetime"] - sat_row["sat_datetime"]
-            )
-        time_mask = time_diff <= time_window
-        lat_mask = 0.2 >= abs(
-            df_field_filtered["field_latitude"] - sat_row["sat_latitude"]
-        )
-        lon_mask = 0.2 >= abs(
-            df_field_filtered["field_longitude"] - sat_row["sat_longitude"]
-        )
-        field_matches = df_field_filtered[time_mask & lat_mask & lon_mask]
-
-        if field_matches.shape[0] > 5:
-            # Filter by Standard Deviation for rrs columns
-            rrs_cols = [
-                col for col in field_matches.columns
-                if col.startswith("field_rrs")
-                and int(col.rsplit("_rrs")[1]) >= 400
-                and int(col.rsplit("_rrs")[1]) <= 700
-            ]
-            if rrs_cols:
-                mean_spectra = field_matches[rrs_cols].mean(axis=0)
-                std_spectra = field_matches[rrs_cols].std(axis=0)
-                within_std = (
-                    abs(field_matches[rrs_cols] - mean_spectra) <= std_max * std_spectra
-                )
-                field_matches = field_matches[within_std.all(axis=1)]
-
-        if not field_matches.empty:
-            # Select the best match based on time delta
-            time_diff = abs(
-                field_matches["field_datetime"] - sat_row["sat_datetime"]
-                )
-            best_match = field_matches.loc[time_diff.idxmin()]
-            df_match_list.append({**best_match.to_dict(), **sat_row.to_dict()})
-
-    df_match = pd.DataFrame(df_match_list)
-    return df_match
