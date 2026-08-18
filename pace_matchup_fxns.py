@@ -358,3 +358,37 @@ def get_sat_ts_matchups(
         print('None granules found.')
 
     return pd.DataFrame(sat_rows)
+
+def FloatMatchup(float_data, sat_type, hour_window = 12, save = False, savename = 'PACE_BGCArgo_matchup.csv'):
+
+    for i in np.arange(float_data.shape[0]):
+    
+        print('\nProfile count', i,' out of ', float_data.shape[0])
+        prof_date = float_data.loc[:,'JULD'].values[i]
+        start_date  = str(prof_date-np.timedelta64(hour_window,'h'))
+        end_date = str(prof_date+np.timedelta64(hour_window,'h'))
+        
+        longitude = float_data.loc[:,'LONGITUDE'].values[i]
+        latitude = float_data.loc[:,'LATITUDE'].values[i]
+    
+        print('All granuales withing +/- '+str(hour_window)+' hours of ',prof_date)
+        print('at ', latitude,'ºN and ', longitude,'ºE')
+    
+        sat_values = get_sat_ts_matchups(start_date, end_date,latitude, longitude,
+                            sat=sat_type)
+    
+        wmo, profnum = float_data.index.values[i]
+        sat_values = sat_values.assign(PLATFORM_NUMBER =  np.ones(sat_values.shape[0], dtype = int)*int(wmo))
+        sat_values = sat_values.assign(CYCLE_NUMBER =  np.ones(sat_values.shape[0], dtype = int)*int(profnum))
+        
+        if i == 0:
+            all_sat = sat_values
+        else:
+            all_sat = pd.concat((all_sat, sat_values))
+    
+    all_sat = all_sat.reset_index(drop=True)
+
+    if save:
+        all_sat.to_csv(savename)
+
+    return all_sat
